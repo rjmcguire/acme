@@ -19,10 +19,13 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"path/filepath"
 	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/google/acme"
 )
@@ -30,11 +33,11 @@ import (
 var (
 	cmdCert = &command{
 		run:       runCert,
-		UsageLine: "cert [-c config] [-d url] [-s host:port] [-k key] [-expiry dur] [-bundle=true] [-manual=false] domain [domain ...]",
+		UsageLine: "cert [-c config] [-d url] [-s host:port] [-k key] [-expiry dur] [-bundle=true] [-manual=false] [-dns=false] domain [domain ...]",
 		Short:     "request a new certificate",
 		Long: `
 Cert creates a new certificate for the given domain.
-It uses http-01 challenge to complete authorization flow.
+It uses the http-01 challenge type by default and dns-01 if -dns is specified.
 
 The certificate will be placed alongside key file, specified with -k argument.
 If the key file does not exist, a new one will be created.
@@ -47,7 +50,7 @@ If this is undesired, specify -bundle=false argument.
 The -s argument specifies the address where to run local server
 for the http-01 challenge. If not specified, 127.0.0.1:8080 will be used.
 
-An alternative to local server challenge response may be specified as -manual,
+An alternative to local server challenge response may be specified with -manual or -dns,
 in which case instructions are displayed on the standard output.
 
 Default location of the config dir is
@@ -60,6 +63,7 @@ Default location of the config dir is
 	certExpiry  = 365 * 12 * time.Hour
 	certBundle  = true
 	certManual  = false
+	certDNS     = false
 	certKeypath string
 )
 
@@ -69,12 +73,16 @@ func init() {
 	cmdCert.flag.DurationVar(&certExpiry, "expiry", certExpiry, "")
 	cmdCert.flag.BoolVar(&certBundle, "bundle", certBundle, "")
 	cmdCert.flag.BoolVar(&certManual, "manual", certManual, "")
+	cmdCert.flag.BoolVar(&certDNS, "dns", certDNS, "")
 	cmdCert.flag.StringVar(&certKeypath, "k", "", "")
 }
 
 func runCert(args []string) {
 	if len(args) == 0 {
 		fatalf("no domain specified")
+	}
+	if certManual && certDNS {
+		fatalf("-dns and -manual are mutually exclusive, only one should be specified")
 	}
 	cn := args[0]
 	if certKeypath == "" {
@@ -107,29 +115,29 @@ func runCert(args []string) {
 		fatalf("csr: %v", err)
 	}
 
-	// perform discovery to get the new-cert URL
-	disco, err := acme.Discover(nil, string(certDisco))
-	if err != nil {
-		fatalf("discovery: %v", err)
-	}
 	// initialize acme client and start authz flow
 	// we only look for http-01 challenges at the moment
-	client := &acme.Client{Key: uc.key}
+	client := &acme.Client{
+		Key:          uc.key,
+		DirectoryURL: string(certDisco),
+	}
 	for _, domain := range args {
-		if err := authz(client, uc.Authz, domain); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		if err := authz(ctx, client, domain); err != nil {
 			fatalf("%s: %v", domain, err)
 		}
+		cancel()
 	}
 
 	// challenge fulfilled: get the cert
-	cert, curl, err := client.CreateCert(disco.CertURL, csr, certExpiry, certBundle)
+	// wait at most 30 min
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	cert, curl, err := client.CreateCert(ctx, csr, certExpiry, certBundle)
 	if err != nil {
 		fatalf("cert: %v", err)
 	}
 	logf("cert url: %s", curl)
-	if cert == nil {
-		cert = pollCert(curl)
-	}
 	var pemcert []byte
 	for _, b := range cert {
 		b = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: b})
@@ -141,15 +149,18 @@ func runCert(args []string) {
 	}
 }
 
-func authz(client *acme.Client, zurl, domain string) error {
-	z, err := client.Authorize(zurl, domain)
+func authz(ctx context.Context, client *acme.Client, domain string) error {
+	z, err := client.Authorize(ctx, domain)
 	if err != nil {
 		return err
 	}
+	if z.Status == acme.StatusValid {
+		return nil
+	}
 	var chal *acme.Challenge
 	for _, c := range z.Challenges {
-		if c.Type == "http-01" {
-			chal = &c
+		if (c.Type == "http-01" && !certDNS) || (c.Type == "dns-01" && certDNS) {
+			chal = c
 			break
 		}
 	}
@@ -164,55 +175,46 @@ func authz(client *acme.Client, zurl, domain string) error {
 	}
 	defer ln.Close()
 
-	if certManual {
+	switch {
+	case certManual:
 		// manual challenge response
-		tok := fmt.Sprintf("%s.%s", chal.Token, acme.JWKThumbprint(&client.Key.PublicKey))
+		tok, err := client.HTTP01ChallengeResponse(chal.Token)
+		if err != nil {
+			return err
+		}
 		file, err := challengeFile(domain, tok)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("Copy %s to ROOT/.well-known/acme-challenge/%s of %s and press enter.\n",
-			file, chal.Token, domain)
+		fmt.Printf("Copy %s to http://%s%s and press enter.\n",
+			file, domain, client.HTTP01ChallengePath(chal.Token))
 		var x string
 		fmt.Scanln(&x)
-	} else {
+	case certDNS:
+		val, err := client.DNS01ChallengeRecord(chal.Token)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Add a TXT record for _acme-challenge.%s with the value %q and press enter after it has propagated.\n",
+			domain, val)
+		var x string
+		fmt.Scanln(&x)
+	default:
 		// auto, via local server
-		go http.Serve(ln, client.HTTP01Handler(chal.Token))
+		val, err := client.HTTP01ChallengeResponse(chal.Token)
+		if err != nil {
+			return err
+		}
+		path := client.HTTP01ChallengePath(chal.Token)
+		go http.Serve(ln, http01Handler(path, val))
+
 	}
 
-	if _, err := client.Accept(chal); err != nil {
+	if _, err := client.Accept(ctx, chal); err != nil {
 		return fmt.Errorf("accept challenge: %v", err)
 	}
-	for {
-		a, err := client.GetAuthz(z.URI)
-		if err != nil {
-			logf("authz %q: %v\n", z.URI, err)
-		}
-		if a.Status == acme.StatusInvalid {
-			return fmt.Errorf("could not authorize for %s", domain)
-		}
-		if a.Status != acme.StatusValid {
-			// TODO: use Retry-After
-			time.Sleep(time.Duration(3) * time.Second)
-			continue
-		}
-		break
-	}
-	return nil
-}
-
-func pollCert(url string) [][]byte {
-	for {
-		b, err := acme.FetchCert(nil, url, certBundle)
-		if err == nil {
-			return b
-		}
-		d := 3 * time.Second
-		if re, ok := err.(acme.RetryError); ok {
-			d = time.Duration(re)
-		}
-		time.Sleep(d)
-	}
+	_, err = client.WaitAuthorization(ctx, z.URI)
+	return err
 }
 
 func challengeFile(domain, content string) (string, error) {
@@ -225,4 +227,15 @@ func challengeFile(domain, content string) (string, error) {
 		err = err1
 	}
 	return f.Name(), err
+}
+
+func http01Handler(path, value string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != path {
+			log.Printf("unknown request path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Write([]byte(value))
+	})
 }
